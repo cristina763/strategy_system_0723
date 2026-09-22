@@ -19,7 +19,7 @@ def get_db_connection():
 
     return pymssql.connect(
         host=os.getenv("MSSQL_HOST", "127.0.0.1"),
-        user=os.getenv("MSSQL_USER", "yunnn"),
+        user=os.getenv("MSSQL_USER", "***"),  # 已遮罩：原預設使用者名稱可能包含個人識別資訊。
         password=_required_env("MSSQL_PASSWORD"),
         database=os.getenv("MSSQL_DATABASE", "ncu_database2025"),
         charset=os.getenv("MSSQL_CHARSET", "utf8"),
