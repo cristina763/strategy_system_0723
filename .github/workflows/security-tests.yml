@@ -1,0 +1,24 @@
+name: Security query tests
+
+on:
+  push:
+    branches:
+      - codex/security-hardening
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "query_service.py"
+      - "gpt_to_datalist.py"
+      - "config.py"
+      - "tests/**"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m unittest discover -s tests -v
