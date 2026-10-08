@@ -1,177 +1,187 @@
+import json
 import tkinter as tk
 from tkinter import messagebox, scrolledtext
+
 import pandas as pd
-from config import get_db_connection, get_openai_client
+
+from config import (
+    get_db_connection,
+    get_max_analysis_chars,
+    get_max_query_rows,
+    get_openai_client,
+    get_openai_model,
+)
+from gpt_assistant import ask_gpt_about_stock
+from query_service import (
+    ALLOWED_COLUMNS,
+    QueryPlanError,
+    build_select_query,
+    write_audit_event,
+)
 
 
-# 用 GPT 產生 SQL 語句
-def generate_sql(instruction):
-    # Prompt 告訴 GPT 如何根據自然語言需求產生符合 SQL Server 格式的 SQL 指令
+def _parse_json_object(text):
+    cleaned = text.strip().replace("```json", "").replace("```", "").strip()
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start < 0 or end < start:
+        raise QueryPlanError("模型未回傳有效的 JSON 查詢計畫")
+    try:
+        return json.loads(cleaned[start : end + 1])
+    except json.JSONDecodeError as error:
+        raise QueryPlanError("模型回傳的查詢計畫不是有效 JSON") from error
+
+
+def generate_query_plan(instruction):
+    schema = {
+        "operation": "select",
+        "columns": ["Date", "StockCode", "Close", "Volume"],
+        "filters": [
+            {"column": "StockCode", "operator": "=", "value": "2330"}
+        ],
+        "order_by": [{"column": "Date", "direction": "DESC"}],
+        "limit": 100,
+    }
     prompt = f"""
-你是一位資料庫工程師。請根據以下使用者的描述，判斷這是要「查詢」還是「更新」還是「更改」資料，並產生對資料表的正確 SQL 指令，只回傳 SQL 語句，不附加說明，不加```sql 或 ``` 等包裝標記，不加 -- 等註解。
+將使用者需求轉換成唯讀股票資料查詢計畫。
+只回傳一個 JSON object，不要回傳 SQL、Markdown 或說明。
+operation 必須是 select。
+可用欄位：{", ".join(ALLOWED_COLUMNS)}
+filters 的 operator 只能使用 =、!=、>、>=、<、<=、LIKE。
+order_by 的 direction 只能使用 ASC 或 DESC。
+最多回傳 {get_max_query_rows()} 筆資料。
+不得建立、修改或刪除任何資料。
+不得加入 JSON schema 以外的欄位。
 
-trading_stock_test 資料表欄位有：Date, StockCode, Capacity, Volume, Open, High, Low, Close, Change, Transaction, MA5, MA10, MA20, MA60, MA120, MA240, K_value, D_value。
+格式範例：
+{json.dumps(schema, ensure_ascii=False)}
 
-- 所有欄位名稱都必須加上中括號（如 [Close], [K_value]）
-- 若用 [Date] 查詢，請使用 CAST([Date] AS DATE)
-- 如果你使用 UNION ALL 並搭配 ORDER BY，請將每個子查詢包在 SELECT * FROM (...) AS 別名 裡，並於子查詢中使用 TOP N（如 TOP 1）才能被 SQL Server 接受。
-- 不要提供註解或說明。
-- 不要使用 ```sql 或 ``` 等包裝標記。
-- 若需要多段 SQL 指令，請用分號分隔即可。
-- 若用 UNION 搭配 TOP + ORDER BY，請將每段查詢包在 SELECT * FROM (...) 中，並給定別名（如 MaxRise, MaxDrop），避免語法錯誤。
-
-使用者描述：
+使用者需求：
 {instruction}
 """
-    # 呼叫 GPT 產生回應
-    res = get_openai_client().chat.completions.create(
-        model="gpt-4",
+    response = get_openai_client().chat.completions.create(
+        model=get_openai_model(),
         messages=[
-            {"role": "system", "content": "你是一位熟悉 SQL 的資料庫工程師"},
-            {"role": "user", "content": prompt}
-        ]
+            {
+                "role": "system",
+                "content": "你只負責建立唯讀、結構化、可驗證的查詢計畫。",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0,
     )
-    # 回傳 GPT 回傳的 SQL 指令，移除前後空白
-    return res.choices[0].message.content.strip().replace("```sql", "").replace("```", "").strip()
+    return _parse_json_object(response.choices[0].message.content)
 
-# 若 SQL 執行錯誤，請 GPT 協助修正 SQL 的函式
-def fix_sql_with_gpt(user_prompt, sql_attempted, error_message):
-    # 包含原始需求、錯誤 SQL、錯誤訊息，請 GPT 幫忙修正
-    prompt = f"""
-你是一位熟悉 SQL Server 的資料庫工程師，我剛使用以下自然語言需求產生 SQL，但執行時出錯。
 
-請你幫我修正這段 SQL。注意：只回傳正確的 SQL 指令，不要說明、不加註解、不加 ```sql ``` 或 ``` 。
-如果你使用 UNION ALL 並搭配 ORDER BY，請將每個子查詢包在 SELECT * FROM (...) AS 別名 裡，並於子查詢中使用 TOP N（如 TOP 1）才能被 SQL Server 接受。
-原始需求：
-{user_prompt}
-
-原始 SQL：
-{sql_attempted}
-
-錯誤訊息：
-{error_message}
-"""
-    # 呼叫 GPT 修正錯誤的 SQL
-    res = get_openai_client().chat.completions.create(
-        model="gpt-4",
-        messages=[
-            {"role": "system", "content": "你是一位熟悉 SQL 的資料庫工程師"},
-            {"role": "user", "content": prompt}
-        ]
-    )
-    # 回傳修正後的 SQL，並移除可能會有的包裝標記（例如 GPT 回傳時加上的 ```sql）
-    return res.choices[0].message.content.strip().replace("```sql", "").replace("```", "").strip()
-
-# 嘗試查詢資料庫，若失敗則自動請 GPT 修正 SQL 再試一次
-def execute_query_with_retry(sql, user_prompt):
-    conn = None
+def execute_readonly_query(sql, parameters):
+    connection = get_db_connection()
     try:
-        conn = get_db_connection()
-        # 嘗試用 pandas 直接執行 SQL 並轉成 DataFrame
-        df = pd.read_sql(sql, conn)
-        return df.to_string(index=False)
-    except Exception as e:
-        # 若執行錯誤，顯示錯誤訊息並讓 GPT 修正
-        error_msg = str(e)
-        print("初次查詢錯誤，嘗試讓 GPT 修正 SQL...")
-        fixed_sql = fix_sql_with_gpt(user_prompt, sql, error_msg)
-        try:
-            # 修正後再執行一次
-            df = pd.read_sql(fixed_sql, conn)
-            return f"原始查詢失敗，已修正 SQL：\n{fixed_sql}\n\n修正查詢結果：\n" + df.to_string(index=False)
-        except Exception as e2:
-            return f"修正後仍查詢失敗：{e2}\n修正 SQL：\n{fixed_sql}"
+        cursor = connection.cursor()
+        cursor.execute(sql, tuple(parameters))
+        rows = cursor.fetchall()
+        columns = [item[0] for item in cursor.description]
+        return pd.DataFrame(rows, columns=columns)
     finally:
-        if conn is not None:
-            conn.close()
-
-# 執行sql
-def execute_update(sql, user_prompt):
-    conn = None
-    try:
-        conn = get_db_connection()
-        # 執行SQL並提交
-        cursor = conn.cursor()
-        cursor.execute(sql)
-        conn.commit()
-        return "成功更新資料"
-    except Exception as e:
-        error_msg = str(e)
-        print("初次修正錯誤，嘗試讓 GPT 修正 SQL...")
-        fixed_sql = fix_sql_with_gpt(user_prompt, sql, error_msg)
-        try:
-            # 修正後再執行一次
-            df = pd.read_sql(fixed_sql, conn)
-            return f"原始修改失敗，已修正 SQL：\n{fixed_sql}\n\n修正查詢結果：\n" + df.to_string(index=False)
-        except Exception as e2:
-            return f"修正後仍失敗：{e2}\n修正 SQL：\n{fixed_sql}"
-    finally:
-        if conn is not None:
-            conn.close()
+        connection.close()
 
 
-# 建立 GUI 中的第二個頁籤（供使用者輸入需求 → 產生 SQL → 顯示查詢或更新結果）
 def create_tab2(tab):
-    # 這些元件需在內部函式中共享
-    # 執行 SQL 的內部函式
-    def run_sql():
-        # 讀取輸入區文字
+    latest_result = {"analysis_text": ""}
+
+    def run_query():
         user_input = input_text.get("1.0", tk.END).strip()
         if not user_input:
-            messagebox.showwarning("提醒", "請輸入")
+            messagebox.showwarning("提醒", "請輸入查詢需求")
             return
-        
+
         output_text.delete("1.0", tk.END)
-        output_text.insert(tk.END, "正在產生 SQL...\n")
+        output_text.insert(tk.END, "正在建立安全查詢計畫...\n")
         tab.update()
 
-        # 呼叫 GPT 產生 SQL
-        sql_cmd = generate_sql(user_input)
-        output_text.insert(tk.END, f"\n產生 SQL：\n{sql_cmd}\n")
+        plan = None
+        try:
+            plan = generate_query_plan(user_input)
+            sql, parameters, normalized_plan = build_select_query(
+                plan, get_max_query_rows()
+            )
+            frame = execute_readonly_query(sql, parameters)
+            result_text = (
+                "查無資料"
+                if frame.empty
+                else frame.to_string(index=False)
+            )
+            latest_result["analysis_text"] = frame.to_csv(index=False)[
+                : get_max_analysis_chars()
+            ]
+            write_audit_event(
+                user_input,
+                normalized_plan,
+                "success",
+                row_count=len(frame.index),
+            )
+            output_text.delete("1.0", tk.END)
+            output_text.insert(
+                tk.END,
+                "安全查詢計畫：\n"
+                + json.dumps(normalized_plan, ensure_ascii=False, indent=2)
+                + "\n\n查詢結果：\n"
+                + result_text,
+            )
+        except QueryPlanError as error:
+            latest_result["analysis_text"] = ""
+            write_audit_event(
+                user_input,
+                plan,
+                "rejected",
+                error_type=type(error).__name__,
+            )
+            output_text.delete("1.0", tk.END)
+            output_text.insert(tk.END, f"查詢已拒絕：{error}")
+        except Exception as error:
+            latest_result["analysis_text"] = ""
+            write_audit_event(
+                user_input,
+                plan,
+                "failed",
+                error_type=type(error).__name__,
+            )
+            output_text.delete("1.0", tk.END)
+            output_text.insert(
+                tk.END,
+                f"查詢失敗：{type(error).__name__}",
+            )
 
-        # 根據語句開頭判斷是哪一種操作
-        if sql_cmd.strip().lower().startswith("select"):
-            result = execute_query_with_retry(sql_cmd, user_input)
-            output_text.insert(tk.END, f"\n查詢結果：\n{result}")
-        elif sql_cmd.strip().lower().startswith("update"):
-            # 若為更新，詢問使用者是否執行
-            confirm = messagebox.askyesno("確認", "是否要執行這段 UPDATE 指令？")
-            if confirm:
-                result = execute_update(sql_cmd, user_input)
-                output_text.insert(tk.END, f"\n{result}")
-            else:
-                output_text.insert(tk.END, "\n已取消更新。")
-        elif sql_cmd.strip().lower().startswith("delete"):
-            confirm = messagebox.askyesno("確認", "是否要執行這段 DELETE 指令？")
-            if confirm:
-                result = execute_update(sql_cmd, user_input)
-                output_text.insert(tk.END, f"\n{result}")
-            else:
-                output_text.insert(tk.END, "\n已取消更新。")
-        else:
-            result = execute_update(sql_cmd, user_input)
-            output_text.insert(tk.END, f"\n{result}")
-
-    # 執行技術分析（使用 GPT 進行評論）
     def run_tech_analysis():
-        data_text = output_text.get("1.0", tk.END).strip()
+        data_text = latest_result["analysis_text"]
         if not data_text:
-            messagebox.showwarning("提醒", "請先執行查詢後再分析")
+            messagebox.showwarning("提醒", "請先完成查詢後再分析")
             return
         output_text.insert(tk.END, "\n\n技術分析中...\n")
         tab.update()
         result = ask_gpt_about_stock(data_text)
         output_text.insert(tk.END, f"\n技術分析建議：\n{result}")
 
-    # GUI 組件建立（輸入區、按鈕、輸出區）
-    tk.Label(tab, text="輸入需求：").pack(anchor='w')
+    tk.Label(tab, text="輸入唯讀查詢需求：").pack(anchor="w")
     input_text = scrolledtext.ScrolledText(tab, height=5, font=("Courier", 12))
     input_text.pack(fill="x", padx=10)
 
-    btn_frame = tk.Frame(tab)
-    btn_frame.pack(pady=10)
-    tk.Button(btn_frame, text="產生 SQL 並執行", command=run_sql, width=20).pack(side="left", padx=5)
+    button_frame = tk.Frame(tab)
+    button_frame.pack(pady=10)
+    tk.Button(
+        button_frame,
+        text="建立安全查詢並執行",
+        command=run_query,
+        width=22,
+    ).pack(side="left", padx=5)
+    tk.Button(
+        button_frame,
+        text="分析查詢結果",
+        command=run_tech_analysis,
+        width=18,
+    ).pack(side="left", padx=5)
 
-    tk.Label(tab, text="執行結果：").pack(anchor='w')
-    output_text = scrolledtext.ScrolledText(tab, height=25, font=("Courier", 12))
+    tk.Label(tab, text="執行結果：").pack(anchor="w")
+    output_text = scrolledtext.ScrolledText(
+        tab, height=25, font=("Courier", 12)
+    )
     output_text.pack(fill="both", expand=True, padx=10, pady=5)
